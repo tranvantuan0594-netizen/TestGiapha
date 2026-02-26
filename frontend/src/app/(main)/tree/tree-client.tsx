@@ -143,7 +143,7 @@ function computePersonGenerations(people: TreeNode[], families: TreeFamily[]): M
     const roots = people.filter(p => !childOf.has(p.handle));
     const gens = new Map<string, number>();
     const familyMap = new Map(families.map(f => [f.handle, f]));
-    const queue: { handle: string; gen: number }[] = roots.map(r => ({ handle: r.handle, gen: 0 }));
+    const queue: { handle: string; gen: number }[] = roots.map(r => ({ handle: r.handle, gen: 1 }));
     while (queue.length > 0) {
         const { handle, gen } = queue.shift()!;
         if (gens.has(handle)) continue;
