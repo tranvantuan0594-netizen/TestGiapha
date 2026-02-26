@@ -137,31 +137,48 @@ function computeTreeStats(nodes: PositionedNode[], families: TreeFamily[]): Tree
 const AUTO_COLLAPSE_GEN = 8;
 
 // Compute generations via BFS from root persons (persons not in any family as children)
-function computePersonGenerations(people: TreeNode[], families: TreeFamily[]): Map<string, number> {
-    const childOf = new Set<string>();
-    for (const f of families) for (const ch of f.children) childOf.add(ch);
-    const roots = people.filter(p => !childOf.has(p.handle));
-    const gens = new Map<string, number>();
-    const familyMap = new Map(families.map(f => [f.handle, f]));
-    const queue: { handle: string; gen: number }[] = roots.map(r => ({ handle: r.handle, gen: 1 }));
-    while (queue.length > 0) {
-        const { handle, gen } = queue.shift()!;
-        if (gens.has(handle)) continue;
-        gens.set(handle, gen);
-        const person = people.find(p => p.handle === handle);
-        if (!person) continue;
-        for (const fId of person.families) {
-            const fam = familyMap.get(fId);
-            if (!fam) continue;
-            // Spouse at same gen
-            if (fam.fatherHandle && !gens.has(fam.fatherHandle)) gens.set(fam.fatherHandle, gen);
-            if (fam.motherHandle && !gens.has(fam.motherHandle)) gens.set(fam.motherHandle, gen);
-            for (const ch of fam.children) {
-                if (!gens.has(ch)) queue.push({ handle: ch, gen: gen + 1 });
-            }
-        }
-    }
-    return gens;
+function computePersonGenerations(
+  people: TreeNode[],
+  families: TreeFamily[]
+): Map<string, number> {
+
+  const generations = new Map<string, number>();
+
+  // 1️⃣ Tìm tất cả children
+  const allChildren = new Set<string>();
+  families.forEach(f => {
+    f.children.forEach(c => allChildren.add(c));
+  });
+
+  // 2️⃣ Root = người không phải con của ai
+  const roots = people
+    .filter(p => !allChildren.has(p.handle))
+    .map(p => p.handle);
+
+  // 3️⃣ Root = đời 1
+  roots.forEach(r => generations.set(r, 1));
+
+  const queue = [...roots];
+
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    const parentGen = generations.get(parent)!;
+
+    families.forEach(f => {
+      if (f.husband === parent || f.wife === parent) {
+        f.children.forEach(child => {
+          if (!generations.has(child)) {
+            generations.set(child, parentGen + 1);
+            queue.push(child);
+          }
+        });
+      }
+    });
+  }
+
+  return generations;
+}
+
 }
 
 export default function TreeViewPage() {
