@@ -140,7 +140,7 @@ const AUTO_COLLAPSE_GEN = 8;
 function computePersonGenerations(people: TreeNode[], families: TreeFamily[]): Map<string, number> {
     const childOf = new Set<string>();
     for (const f of families) for (const ch of f.children) childOf.add(ch);
-    const roots = people.filter(p => p.isPatrilineal && !childOf.has(p.handle));
+    const roots = people.filter(p => !childOf.has(p.handle));
     const gens = new Map<string, number>();
     const familyMap = new Map(families.map(f => [f.handle, f]));
     const queue: { handle: string; gen: number }[] = roots.map(r => ({ handle: r.handle, gen: 0 }));
