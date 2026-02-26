@@ -179,7 +179,6 @@ function computePersonGenerations(
   return generations;
 }
 
-}
 
 export default function TreeViewPage() {
     const router = useRouter();
