@@ -144,18 +144,15 @@ function computePersonGenerations(
 
   const generations = new Map<string, number>();
 
-  // 1️⃣ Tìm tất cả children
   const allChildren = new Set<string>();
   families.forEach(f => {
     f.children.forEach(c => allChildren.add(c));
   });
 
-  // 2️⃣ Root = người không phải con của ai
   const roots = people
     .filter(p => !allChildren.has(p.handle))
     .map(p => p.handle);
 
-  // 3️⃣ Root = đời 1
   roots.forEach(r => generations.set(r, 1));
 
   const queue = [...roots];
@@ -165,7 +162,7 @@ function computePersonGenerations(
     const parentGen = generations.get(parent)!;
 
     families.forEach(f => {
-      if (f.husband === parent || f.wife === parent) {
+      if (f.fatherHandle === parent || f.motherHandle === parent) {
         f.children.forEach(child => {
           if (!generations.has(child)) {
             generations.set(child, parentGen + 1);
@@ -178,6 +175,7 @@ function computePersonGenerations(
 
   return generations;
 }
+
 
 export default function TreeViewPage() {
     const router = useRouter();
