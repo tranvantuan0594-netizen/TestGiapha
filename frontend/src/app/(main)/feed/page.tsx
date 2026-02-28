@@ -1,3 +1,4 @@
+'use client'; // <--- Thêm dòng này vào đầu tiên
 import React, { useState, useEffect } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
