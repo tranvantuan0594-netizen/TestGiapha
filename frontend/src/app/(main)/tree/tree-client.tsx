@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback, useMemo, memo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/components/auth-provider';
 import { ContributeDialog } from '@/components/contribute-dialog';
-import { Search, ZoomIn, ZoomOut, Maximize2, TreePine, Eye, Users, GitBranch, User, ArrowDownToLine, ArrowUpFromLine, Crosshair, X, ChevronDown, ChevronRight, BarChart3, Package, Link, ChevronsDownUp, ChevronsUpDown, Copy, Pencil, Save, RotateCcw, Trash2, ArrowUp, ArrowDown, GripVertical, MessageSquarePlus } from 'lucide-react';
+import { Search, ZoomIn, ZoomOut, Maximize2, TreePine, Eye, Users, GitBranch, User, ArrowDownToLine, ArrowUpFromLine, Crosshair, X, ChevronDown, ChevronRight, BarChart3, Package, Link, ChevronsDownUp, ChevronsUpDown, Copy, Pencil, Save, RotateCcw, Trash2, ArrowUp, ArrowDown, GripVertical, MessageSquarePlus, Shuffle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
@@ -186,6 +186,14 @@ export default function TreeViewPage() {
     const [collapsedBranches, setCollapsedBranches] = useState<Set<string>>(new Set());
     // F3: Stats panel user-hidden
     const [statsHidden, setStatsHidden] = useState(false);
+
+    // Relationship finder
+    const [showRelFinder, setShowRelFinder] = useState(false);
+    const [relPerson1, setRelPerson1] = useState<string | null>(null);
+    const [relPerson2, setRelPerson2] = useState<string | null>(null);
+    const [relSearch1, setRelSearch1] = useState('');
+    const [relSearch2, setRelSearch2] = useState('');
+    const [relResult, setRelResult] = useState<string | null>(null);
 
     // Editor mode state
     const [editorMode, setEditorMode] = useState(false);
@@ -554,25 +562,38 @@ export default function TreeViewPage() {
         let pp = '';
         let cp = '';
         const vc: PositionedCouple[] = [];
-        // Only render connections where at least one endpoint is visible
-        for (const c of layout.connections) {
-            // Check if any endpoint is near visible area
-            const vw = viewportRef.current?.clientWidth ?? 1200;
-            const vh = viewportRef.current?.clientHeight ?? 900;
-            const { x: tx, y: ty, scale } = transform;
-            const left = (-tx / scale) - CULL_PAD;
-            const top = (-ty / scale) - CULL_PAD;
-            const right = ((vw - tx) / scale) + CULL_PAD;
-            const bottom = ((vh - ty) / scale) + CULL_PAD;
-            const inView = (x: number, y: number) =>
-                x >= left && x <= right && y >= top && y <= bottom;
-            if (!inView(c.fromX, c.fromY) && !inView(c.toX, c.toY)) continue;
 
+        const vw = viewportRef.current?.clientWidth ?? 1200;
+        const vh = viewportRef.current?.clientHeight ?? 900;
+        const { x: tx, y: ty, scale } = transform;
+        const left = (-tx / scale) - CULL_PAD;
+        const top = (-ty / scale) - CULL_PAD;
+        const right = ((vw - tx) / scale) + CULL_PAD;
+        const bottom = ((vh - ty) / scale) + CULL_PAD;
+
+        // True segment-vs-AABB test: a line from (x1,y1)→(x2,y2) intersects the rect
+        // if at least one endpoint is inside OR the segment crosses any edge.
+        const segmentIntersectsView = (x1: number, y1: number, x2: number, y2: number) => {
+            // Quick accept: either endpoint inside
+            if (x1 >= left && x1 <= right && y1 >= top && y1 <= bottom) return true;
+            if (x2 >= left && x2 <= right && y2 >= top && y2 <= bottom) return true;
+            // Both endpoints outside — check if segment crosses the rect
+            // For axis-aligned segments (which these are) this is simple:
+            if (x1 === x2) {
+                // Vertical segment: x must be in [left,right], y range must overlap [top,bottom]
+                return x1 >= left && x1 <= right &&
+                    Math.min(y1, y2) <= bottom && Math.max(y1, y2) >= top;
+            }
+            // Horizontal segment: y must be in [top,bottom], x range must overlap [left,right]
+            return y1 >= top && y1 <= bottom &&
+                Math.min(x1, x2) <= right && Math.max(x1, x2) >= left;
+        };
+
+        for (const c of layout.connections) {
+            if (!segmentIntersectsView(c.fromX, c.fromY, c.toX, c.toY)) continue;
             if (c.type === 'couple') {
                 cp += `M${c.fromX},${c.fromY}L${c.toX},${c.toY}`;
             } else {
-                // Each connection segment is already a single straight line
-                // (either horizontal or vertical) from the layout engine
                 pp += `M${c.fromX},${c.fromY}L${c.toX},${c.toY}`;
             }
         }
@@ -587,12 +608,12 @@ export default function TreeViewPage() {
 
     // Stable callbacks for PersonCard
     const handleCardHover = useCallback((h: string | null) => setHoveredHandle(h), []);
-    const handleCardClick = useCallback((handle: string, x: number, y: number) => {
+    const handleCardClick = useCallback((handle: string, clientX: number, clientY: number) => {
         if (editorMode) {
             setSelectedCard(handle);
             return;
         }
-        setContextMenu({ handle, x, y });
+        setContextMenu({ handle, x: clientX, y: clientY });
     }, [editorMode]);
     const handleCardFocus = useCallback((handle: string) => {
         setFocusPerson(handle);
@@ -661,62 +682,91 @@ export default function TreeViewPage() {
     }, []);
 
     // === Touch handlers ===
+    // Use a ref to hold current transform so touch handlers never go stale
+    const transformRef = useRef(transform);
+    useEffect(() => { transformRef.current = transform; }, [transform]);
+
     useEffect(() => {
         const el = viewportRef.current;
         if (!el) return;
 
+        const TAP_THRESHOLD = 8; // px — movement less than this = tap, not drag
         let touching = false;
-        let lastTouches: Touch[] = [];
+        let didDrag = false;
+        let lastSingleX = 0;
+        let lastSingleY = 0;
+        let startX = 0;
+        let startY = 0;
 
         const onTouchStart = (e: TouchEvent) => {
+            // Never preventDefault on touchstart — let browser handle focus/click on interactive elements
             if (e.touches.length === 1) {
                 touching = true;
-                const t = e.touches[0];
-                dragRef.current = { startX: t.clientX, startY: t.clientY, startTx: transform.x, startTy: transform.y };
+                didDrag = false;
+                startX = lastSingleX = e.touches[0].clientX;
+                startY = lastSingleY = e.touches[0].clientY;
             } else if (e.touches.length === 2) {
-                const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-                pinchRef.current = { initialDist: dist, initialScale: transform.scale };
+                touching = false;
+                didDrag = true; // treat pinch as "drag" so touchend doesn't fire click
+                const dist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY,
+                );
+                pinchRef.current = { initialDist: dist, initialScale: transformRef.current.scale };
             }
-            lastTouches = Array.from(e.touches);
         };
 
         const onTouchMove = (e: TouchEvent) => {
-            e.preventDefault();
             if (e.touches.length === 1 && touching) {
-                const t = e.touches[0];
-                const dx = t.clientX - dragRef.current.startX;
-                const dy = t.clientY - dragRef.current.startY;
-                setTransform(prev => ({ ...prev, x: dragRef.current.startTx + dx, y: dragRef.current.startTy + dy }));
+                const dx = e.touches[0].clientX - startX;
+                const dy = e.touches[0].clientY - startY;
+                // Only start dragging (and prevent scroll) once threshold exceeded
+                if (!didDrag && Math.hypot(dx, dy) < TAP_THRESHOLD) return;
+                e.preventDefault();
+                didDrag = true;
+                const moveDx = e.touches[0].clientX - lastSingleX;
+                const moveDy = e.touches[0].clientY - lastSingleY;
+                lastSingleX = e.touches[0].clientX;
+                lastSingleY = e.touches[0].clientY;
+                setTransform(prev => ({ ...prev, x: prev.x + moveDx, y: prev.y + moveDy }));
             } else if (e.touches.length === 2) {
-                const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+                e.preventDefault();
+                const dist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY,
+                );
                 const ratio = dist / pinchRef.current.initialDist;
-                const newScale = Math.min(Math.max(pinchRef.current.initialScale * ratio, 0.15), 3);
-
+                const newScale = Math.min(Math.max(pinchRef.current.initialScale * ratio, 0.12), 3);
                 const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
                 const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
                 const rect = el.getBoundingClientRect();
                 const mx = midX - rect.left;
                 const my = midY - rect.top;
-
                 setTransform(prev => {
                     const r = newScale / prev.scale;
                     return { scale: newScale, x: mx - (mx - prev.x) * r, y: my - (my - prev.y) * r };
                 });
             }
-            lastTouches = Array.from(e.touches);
         };
 
-        const onTouchEnd = () => { touching = false; };
+        const onTouchEnd = (e: TouchEvent) => {
+            if (e.touches.length === 0) touching = false;
+            if (e.touches.length === 1) {
+                lastSingleX = e.touches[0].clientX;
+                lastSingleY = e.touches[0].clientY;
+            }
+        };
 
-        el.addEventListener('touchstart', onTouchStart, { passive: false });
+        el.addEventListener('touchstart', onTouchStart, { passive: true });
         el.addEventListener('touchmove', onTouchMove, { passive: false });
-        el.addEventListener('touchend', onTouchEnd);
+        el.addEventListener('touchend', onTouchEnd, { passive: true });
         return () => {
             el.removeEventListener('touchstart', onTouchStart);
             el.removeEventListener('touchmove', onTouchMove);
             el.removeEventListener('touchend', onTouchEnd);
         };
-    }, [transform.x, transform.y, transform.scale]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Pan to person
     const panToPerson = useCallback((handle: string) => {
@@ -767,53 +817,57 @@ export default function TreeViewPage() {
     // connPath kept for compatibility but unused with batched rendering
 
     return (
-        <div className="flex flex-col h-[calc(100vh-80px)]">
-            {/* Header */}
-            <div className="flex items-center justify-between flex-wrap gap-2 px-1 pb-2">
-                <div>
-                    <h1 className="text-xl font-bold tracking-tight flex items-center gap-2">
-                        <TreePine className="h-5 w-5" /> Cây gia phả
-                    </h1>
-                    <p className="text-muted-foreground text-xs">
-                        {layout ? `${layout.nodes.length} thành viên` : 'Đang tải...'}
-                        {viewMode !== 'full' && focusPerson && (
-                            <span className="ml-1 text-blue-500">
-                                • {viewMode === 'ancestor' ? 'Tổ tiên' : 'Hậu duệ'} của{' '}
-                                {treeData?.people.find(p => p.handle === focusPerson)?.displayName}
-                            </span>
-                        )}
-                    </p>
+        <div className="flex flex-col h-[calc(100dvh-68px)] md:h-[calc(100vh-80px)]">
+
+            {/* ── Desktop-only top toolbar ── */}
+            <div className="hidden md:flex flex-col gap-1.5 px-1 pb-2 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
+                <div className="flex items-center justify-between sm:block">
+                    <div>
+                        <h1 className="text-lg sm:text-xl font-bold tracking-tight flex items-center gap-1.5">
+                            <TreePine className="h-4 w-4 sm:h-5 sm:w-5" /> Cây gia phả
+                        </h1>
+                        <p className="text-muted-foreground text-xs leading-tight">
+                            {layout ? `${layout.nodes.length} thành viên` : 'Đang tải...'}
+                            {viewMode !== 'full' && focusPerson && (
+                                <span className="ml-1 text-blue-500">
+                                    • {viewMode === 'ancestor' ? 'Tổ tiên' : 'Hậu duệ'} của{' '}
+                                    {treeData?.people.find(p => p.handle === focusPerson)?.displayName}
+                                </span>
+                            )}
+                        </p>
+                    </div>
+                    {isAdmin && (
+                        <Button variant={editorMode ? 'default' : 'outline'} size="icon"
+                            className={`h-8 w-8 sm:hidden ${editorMode ? 'bg-blue-600 hover:bg-blue-700 text-white' : ''}`}
+                            onClick={() => { setEditorMode(m => !m); setSelectedCard(null); }}>
+                            <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                    )}
                 </div>
                 <div className="flex items-center gap-1.5 flex-wrap">
-                    {/* View modes */}
                     <div className="flex rounded-lg border overflow-hidden text-xs">
                         {([['full', 'Toàn cảnh', Eye], ['ancestor', 'Tổ tiên', Users], ['descendant', 'Hậu duệ', GitBranch]] as const).map(([mode, label, Icon]) => (
                             <button key={mode} onClick={() => changeViewMode(mode)}
-                                className={`px-2.5 py-1.5 font-medium flex items-center gap-1 transition-colors ${mode !== 'full' ? 'border-l' : ''} ${viewMode === mode ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}>
-                                <Icon className="h-3.5 w-3.5" /> {label}
+                                className={`px-2 py-1.5 font-medium flex items-center gap-1 transition-colors ${mode !== 'full' ? 'border-l' : ''} ${viewMode === mode ? 'bg-primary text-primary-foreground' : 'hover:bg-muted active:bg-muted'}`}>
+                                <Icon className="h-3.5 w-3.5" /><span>{label}</span>
                             </button>
                         ))}
                     </div>
-                    {/* Search */}
-                    <div className="relative">
-                        <div className="relative w-44">
+                    <div className="relative flex-1 min-w-[120px] max-w-[200px]">
+                        <div className="relative">
                             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
                             <Input placeholder="Tìm kiếm..." value={searchQuery}
                                 onChange={e => { setSearchQuery(e.target.value); setShowSearch(true); }}
-                                onFocus={() => setShowSearch(true)} className="pl-8 h-8 text-xs" />
+                                onFocus={() => setShowSearch(true)} className="pl-8 h-8 text-xs w-full" />
                         </div>
                         {showSearch && searchResults.length > 0 && (
                             <Card className="absolute z-50 w-56 right-0 top-10 shadow-lg">
                                 <CardContent className="p-1 max-h-52 overflow-y-auto">
                                     {searchResults.map(p => (
                                         <button key={p.handle} onClick={() => {
-                                            setFocusPerson(p.handle);
-                                            setViewMode('descendant');
-                                            autoCollapseForDescendant(p.handle);
-                                            setShowSearch(false);
-                                            setSearchQuery('');
-                                        }}
-                                            className="w-full text-left px-2.5 py-1.5 rounded text-xs hover:bg-accent transition-colors flex justify-between">
+                                            setFocusPerson(p.handle); setViewMode('descendant');
+                                            autoCollapseForDescendant(p.handle); setShowSearch(false); setSearchQuery('');
+                                        }} className="w-full text-left px-2.5 py-2 rounded text-xs hover:bg-accent active:bg-accent transition-colors flex justify-between">
                                             <span className="font-medium">{p.displayName}</span>
                                             <span className="text-muted-foreground">{'generation' in p ? `Đời ${(p as any).generation}` : ''}{p.isPrivacyFiltered ? ' 🔒' : ''}</span>
                                         </button>
@@ -822,33 +876,19 @@ export default function TreeViewPage() {
                             </Card>
                         )}
                     </div>
-                    {/* Controls */}
                     <div className="flex gap-0.5">
+                        <Button variant="outline" size="icon" className="h-8 w-8" title="Tìm quan hệ" onClick={() => setShowRelFinder(true)}><Shuffle className="h-3.5 w-3.5" /></Button>
                         <Button variant="outline" size="icon" className="h-8 w-8" title="Thu gọn tất cả" onClick={collapseAll}><ChevronsDownUp className="h-3.5 w-3.5" /></Button>
                         <Button variant="outline" size="icon" className="h-8 w-8" title="Mở rộng tất cả" onClick={expandAll}><ChevronsUpDown className="h-3.5 w-3.5" /></Button>
                         <div className="w-px bg-border mx-0.5" />
-                        <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setTransform(t => {
-                            const vw = viewportRef.current?.clientWidth ?? 0; const vh = viewportRef.current?.clientHeight ?? 0;
-                            const cx = vw / 2; const cy = vh / 2;
-                            const ns = Math.min(t.scale * 1.3, 3); const r = ns / t.scale;
-                            return { scale: ns, x: cx - (cx - t.x) * r, y: cy - (cy - t.y) * r };
-                        })}><ZoomIn className="h-3.5 w-3.5" /></Button>
-                        <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setTransform(t => {
-                            const vw = viewportRef.current?.clientWidth ?? 0; const vh = viewportRef.current?.clientHeight ?? 0;
-                            const cx = vw / 2; const cy = vh / 2;
-                            const ns = Math.max(t.scale / 1.3, 0.15); const r = ns / t.scale;
-                            return { scale: ns, x: cx - (cx - t.x) * r, y: cy - (cy - t.y) * r };
-                        })}><ZoomOut className="h-3.5 w-3.5" /></Button>
+                        <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setTransform(t => { const vw = viewportRef.current?.clientWidth ?? 0; const vh = viewportRef.current?.clientHeight ?? 0; const cx = vw / 2; const cy = vh / 2; const ns = Math.min(t.scale * 1.3, 3); const r = ns / t.scale; return { scale: ns, x: cx - (cx - t.x) * r, y: cy - (cy - t.y) * r }; })}><ZoomIn className="h-3.5 w-3.5" /></Button>
+                        <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => setTransform(t => { const vw = viewportRef.current?.clientWidth ?? 0; const vh = viewportRef.current?.clientHeight ?? 0; const cx = vw / 2; const cy = vh / 2; const ns = Math.max(t.scale / 1.3, 0.15); const r = ns / t.scale; return { scale: ns, x: cx - (cx - t.x) * r, y: cy - (cy - t.y) * r }; })}><ZoomOut className="h-3.5 w-3.5" /></Button>
                         <Button variant="outline" size="icon" className="h-8 w-8" onClick={fitAll}><Maximize2 className="h-3.5 w-3.5" /></Button>
                         <div className="w-px bg-border mx-0.5" />
                         {isAdmin && (
-                            <Button
-                                variant={editorMode ? 'default' : 'outline'}
-                                size="icon"
-                                className={`h-8 w-8 ${editorMode ? 'bg-blue-600 hover:bg-blue-700 text-white' : ''}`}
-                                title={editorMode ? 'Tắt chỉnh sửa' : 'Chế độ chỉnh sửa'}
-                                onClick={() => { setEditorMode(m => !m); setSelectedCard(null); }}
-                            >
+                            <Button variant={editorMode ? 'default' : 'outline'} size="icon"
+                                className={`h-8 w-8 hidden sm:flex ${editorMode ? 'bg-blue-600 hover:bg-blue-700 text-white' : ''}`}
+                                onClick={() => { setEditorMode(m => !m); setSelectedCard(null); }}>
                                 <Pencil className="h-3.5 w-3.5" />
                             </Button>
                         )}
@@ -856,10 +896,79 @@ export default function TreeViewPage() {
                 </div>
             </div>
 
+            {/* ── Mobile: compact title bar ── */}
+            <div className="md:hidden flex items-center justify-between px-2 py-1.5 border-b bg-card/80 backdrop-blur-sm shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                    <TreePine className="h-4 w-4 text-primary shrink-0" />
+                    <div className="min-w-0">
+                        <p className="text-sm font-bold leading-tight truncate">Cây gia phả</p>
+                        <p className="text-[10px] text-muted-foreground leading-tight truncate">
+                            {layout ? `${layout.nodes.length} thành viên` : 'Đang tải...'}
+                            {viewMode !== 'full' && focusPerson && (
+                                <span className="text-blue-500 ml-1">
+                                    · {viewMode === 'ancestor' ? 'Tổ tiên' : 'Hậu duệ'} của {treeData?.people.find(p => p.handle === focusPerson)?.displayName}
+                                </span>
+                            )}
+                        </p>
+                    </div>
+                </div>
+                {/* Mobile search toggle */}
+                <div className="flex items-center gap-1">
+                    <button
+                        className="p-1.5 rounded-lg border bg-background text-muted-foreground active:bg-muted"
+                        onClick={() => setShowSearch(s => !s)}
+                    >
+                        <Search className="h-4 w-4" />
+                    </button>
+                    {isAdmin && (
+                        <Button variant={editorMode ? 'default' : 'outline'} size="icon"
+                            className={`h-8 w-8 ${editorMode ? 'bg-blue-600 hover:bg-blue-700 text-white' : ''}`}
+                            onClick={() => { setEditorMode(m => !m); setSelectedCard(null); }}>
+                            <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                    )}
+                </div>
+            </div>
+
+            {/* Mobile search panel (slides down when open) */}
+            {showSearch && (
+                <div className="md:hidden px-2 py-2 border-b bg-card shrink-0 z-10">
+                    <div className="relative">
+                        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                        <Input
+                            placeholder="Tìm tên thành viên..."
+                            value={searchQuery}
+                            onChange={e => setSearchQuery(e.target.value)}
+                            autoFocus
+                            className="pl-8 h-9 text-sm w-full"
+                        />
+                        {searchQuery && (
+                            <button className="absolute right-2 top-1/2 -translate-y-1/2"
+                                onClick={() => { setSearchQuery(''); setShowSearch(false); }}>
+                                <X className="h-4 w-4 text-muted-foreground" />
+                            </button>
+                        )}
+                    </div>
+                    {searchResults.length > 0 && (
+                        <div className="mt-1 bg-background border rounded-lg shadow-lg max-h-48 overflow-y-auto">
+                            {searchResults.map(p => (
+                                <button key={p.handle} onClick={() => {
+                                    setFocusPerson(p.handle); setViewMode('descendant');
+                                    autoCollapseForDescendant(p.handle); setShowSearch(false); setSearchQuery('');
+                                }} className="w-full text-left px-3 py-2.5 text-sm hover:bg-accent active:bg-accent transition-colors flex justify-between border-b last:border-0">
+                                    <span className="font-medium">{p.displayName}</span>
+                                    <span className="text-muted-foreground text-xs">{'generation' in p ? `Đời ${(p as any).generation}` : ''}{p.isPrivacyFiltered ? ' 🔒' : ''}</span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Tree viewport + Editor panel row */}
             <div className="flex-1 flex gap-0 min-h-0">
                 <div ref={viewportRef}
-                    className="flex-1 relative overflow-hidden rounded-xl border-2 bg-gradient-to-br from-background to-muted/30 cursor-grab active:cursor-grabbing select-none"
+                    className="flex-1 relative overflow-hidden md:rounded-xl md:border-2 bg-gradient-to-br from-background to-muted/30 cursor-grab active:cursor-grabbing select-none"
                     onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
                     onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
                     onClick={() => { setShowSearch(false); setContextMenu(null); if (editorMode) setSelectedCard(null); }}
@@ -873,13 +982,13 @@ export default function TreeViewPage() {
                             transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
                             transformOrigin: '0 0', width: layout.width, height: layout.height,
                             position: 'absolute', top: 0, left: 0,
+                            willChange: 'transform',
                         }}>
-                            {/* SVG connections — batched into 2 paths */}
+                            {/* SVG connections */}
                             <svg className="absolute inset-0 pointer-events-none" width={layout.width} height={layout.height}
                                 style={{ overflow: 'visible' }}>
-                                {parentPaths && <path d={parentPaths} stroke="#94a3b8" strokeWidth={1.5} fill="none" />}
-                                {couplePaths && <path d={couplePaths} stroke="#cbd5e1" strokeWidth={1.5} fill="none" strokeDasharray="4,3" />}
-                                {/* Couple hearts — only visible */}
+                                {parentPaths && <path d={parentPaths} stroke="#64748b" strokeWidth={2} fill="none" />}
+                                {couplePaths && <path d={couplePaths} stroke="#94a3b8" strokeWidth={2} fill="none" strokeDasharray="5,3" />}
                                 {visibleCouples.map(c => (
                                     <text key={c.familyHandle}
                                         x={c.midX} y={c.y + CARD_H / 2 + 4}
@@ -887,7 +996,7 @@ export default function TreeViewPage() {
                                 ))}
                             </svg>
 
-                            {/* DOM nodes — only visible (culled) */}
+                            {/* DOM nodes */}
                             {visibleNodes.map(item => (
                                 <MemoPersonCard key={item.node.handle} item={item}
                                     isHighlighted={highlightHandles.has(item.node.handle)}
@@ -904,68 +1013,55 @@ export default function TreeViewPage() {
                                 />
                             ))}
 
-                            {/* F4: Branch summary cards for collapsed nodes */}
+                            {/* Branch summary cards */}
                             {Array.from(branchSummaries.entries()).map(([handle, summary]) => {
                                 const parentNode = layout.nodes.find(n => n.node.handle === handle);
                                 if (!parentNode) return null;
                                 return (
-                                    <BranchSummaryCard
-                                        key={`summary-${handle}`}
-                                        summary={summary}
-                                        parentNode={parentNode}
-                                        zoomLevel={zoomLevel}
-                                        onExpand={() => toggleCollapse(handle)}
-                                    />
+                                    <BranchSummaryCard key={`summary-${handle}`} summary={summary}
+                                        parentNode={parentNode} zoomLevel={zoomLevel}
+                                        onExpand={() => toggleCollapse(handle)} />
                                 );
                             })}
-
-                            {/* Context menu on card */}
-                            {contextMenu && (() => {
-                                const person = treeData?.people.find(p => p.handle === contextMenu.handle);
-                                if (!person) return null;
-                                return (
-                                    <CardContextMenu
-                                        person={person}
-                                        x={contextMenu.x}
-                                        y={contextMenu.y}
-                                        onViewDetail={() => { router.push(`/people/${person.handle}`); setContextMenu(null); }}
-                                        onShowDescendants={() => { setFocusPerson(person.handle); setViewMode('descendant'); setContextMenu(null); }}
-                                        onShowAncestors={() => { setFocusPerson(person.handle); setViewMode('ancestor'); setContextMenu(null); }}
-                                        onSetFocus={() => { panToPerson(person.handle); setContextMenu(null); }}
-                                        onShowFull={() => { setViewMode('full'); setContextMenu(null); }}
-                                        onCopyLink={() => { copyTreeLink(person.handle); setContextMenu(null); }}
-                                        onContribute={() => { setContributePerson({ handle: person.handle, name: person.displayName }); setContextMenu(null); }}
-                                        onClose={() => setContextMenu(null)}
-                                    />
-                                );
-                            })()}
                         </div>
                     )}
 
-                    {/* F2: Generation Row Headers */}
+                    {/* Generation Row Headers */}
                     {layout && (
-                        <GenerationHeaders
-                            generationStats={generationStats}
-                            transform={transform}
-                            cardH={CARD_H}
-                        />
+                        <GenerationHeaders generationStats={generationStats} transform={transform} cardH={CARD_H} />
                     )}
 
-                    {/* F3: Stats Overlay Panel */}
+                    {/* Stats Overlay */}
                     {treeStats && zoomLevel === 'mini' && !statsHidden && (
                         <StatsOverlay stats={treeStats} onClose={() => setStatsHidden(true)} />
                     )}
 
-                    {/* Zoom + culling indicator */}
+                    {/* Context menu (fixed, outside transform) */}
+                    {contextMenu && (() => {
+                        const person = treeData?.people.find(p => p.handle === contextMenu.handle);
+                        if (!person) return null;
+                        return (
+                            <CardContextMenu person={person} x={contextMenu.x} y={contextMenu.y}
+                                onViewDetail={() => { router.push(`/people/${person.handle}`); setContextMenu(null); }}
+                                onShowDescendants={() => { setFocusPerson(person.handle); setViewMode('descendant'); setContextMenu(null); }}
+                                onShowAncestors={() => { setFocusPerson(person.handle); setViewMode('ancestor'); setContextMenu(null); }}
+                                onSetFocus={() => { panToPerson(person.handle); setContextMenu(null); }}
+                                onShowFull={() => { setViewMode('full'); setContextMenu(null); }}
+                                onCopyLink={() => { copyTreeLink(person.handle); setContextMenu(null); }}
+                                onContribute={() => { setContributePerson({ handle: person.handle, name: person.displayName }); setContextMenu(null); }}
+                                onClose={() => setContextMenu(null)} />
+                        );
+                    })()}
+
+                    {/* Zoom % indicator */}
                     <div className="absolute bottom-2 left-2 bg-background/80 backdrop-blur border rounded px-1.5 py-0.5 text-[10px] text-muted-foreground flex gap-1.5">
                         <span>{Math.round(transform.scale * 100)}%</span>
-                        {layout && <span className="opacity-60">·</span>}
-                        {layout && <span>{visibleNodes.length}/{layout.nodes.length} nodes</span>}
+                        {layout && <><span className="opacity-60">·</span><span>{visibleNodes.length}/{layout.nodes.length}</span></>}
                     </div>
 
-                    {/* Focus person selector */}
+                    {/* Focus person selector (desktop) */}
                     {viewMode !== 'full' && treeData && (
-                        <div className="absolute bottom-2 right-2 bg-background/90 backdrop-blur border rounded-lg px-2 py-1.5 flex items-center gap-1.5 text-xs">
+                        <div className="hidden md:flex absolute bottom-2 right-2 bg-background/90 backdrop-blur border rounded-lg px-2 py-1.5 items-center gap-1.5 text-xs">
                             <span className="text-muted-foreground">Gốc:</span>
                             <select value={focusPerson || ''} onChange={e => setFocusPerson(e.target.value)}
                                 className="border rounded px-1.5 py-0.5 text-xs bg-background max-w-[140px]">
@@ -982,6 +1078,29 @@ export default function TreeViewPage() {
                             <Copy className="w-3.5 h-3.5" /> Đã sao chép link!
                         </div>
                     )}
+
+                    {/* ── Mobile floating bottom toolbar ── */}
+                    <div className="md:hidden absolute bottom-3 left-1/2 -translate-x-1/2 z-30
+                        flex items-center gap-1 bg-card/95 backdrop-blur-md border rounded-2xl shadow-xl px-2 py-1.5">
+                        {/* View mode toggle */}
+                        <div className="flex rounded-lg border overflow-hidden text-xs mr-1">
+                            {([['full', Eye], ['ancestor', Users], ['descendant', GitBranch]] as const).map(([mode, Icon]) => (
+                                <button key={mode} onClick={() => changeViewMode(mode)}
+                                    className={`px-2 py-1.5 flex items-center justify-center transition-colors ${mode !== 'full' ? 'border-l' : ''} ${viewMode === mode ? 'bg-primary text-primary-foreground' : 'text-muted-foreground active:bg-muted'}`}>
+                                    <Icon className="h-3.5 w-3.5" />
+                                </button>
+                            ))}
+                        </div>
+                        <div className="w-px bg-border h-5" />
+                        <button className="p-1.5 rounded-lg text-muted-foreground active:bg-muted transition-colors" title="Tìm quan hệ" onClick={() => setShowRelFinder(true)}><Shuffle className="h-4 w-4" /></button>
+                        <div className="w-px bg-border h-5" />
+                        <button className="p-1.5 rounded-lg text-muted-foreground active:bg-muted transition-colors" title="Thu gọn tất cả" onClick={collapseAll}><ChevronsDownUp className="h-4 w-4" /></button>
+                        <button className="p-1.5 rounded-lg text-muted-foreground active:bg-muted transition-colors" title="Mở rộng tất cả" onClick={expandAll}><ChevronsUpDown className="h-4 w-4" /></button>
+                        <div className="w-px bg-border h-5" />
+                        <button className="p-1.5 rounded-lg text-muted-foreground active:bg-muted transition-colors" onClick={() => setTransform(t => { const cx = (viewportRef.current?.clientWidth ?? 0) / 2; const cy = (viewportRef.current?.clientHeight ?? 0) / 2; const ns = Math.min(t.scale * 1.3, 3); const r = ns / t.scale; return { scale: ns, x: cx - (cx - t.x) * r, y: cy - (cy - t.y) * r }; })}><ZoomIn className="h-4 w-4" /></button>
+                        <button className="p-1.5 rounded-lg text-muted-foreground active:bg-muted transition-colors" onClick={() => setTransform(t => { const cx = (viewportRef.current?.clientWidth ?? 0) / 2; const cy = (viewportRef.current?.clientHeight ?? 0) / 2; const ns = Math.max(t.scale / 1.3, 0.15); const r = ns / t.scale; return { scale: ns, x: cx - (cx - t.x) * r, y: cy - (cy - t.y) * r }; })}><ZoomOut className="h-4 w-4" /></button>
+                        <button className="p-1.5 rounded-lg text-muted-foreground active:bg-muted transition-colors" onClick={fitAll}><Maximize2 className="h-4 w-4" /></button>
+                    </div>
                 </div>
 
                 {/* Editor Sidebar Panel */}
@@ -990,10 +1109,7 @@ export default function TreeViewPage() {
                         selectedCard={selectedCard}
                         treeData={treeData}
                         onReorderChildren={(familyHandle, newOrder) => {
-                            setTreeData(prev => prev ? {
-                                ...prev,
-                                families: prev.families.map(f => f.handle === familyHandle ? { ...f, children: newOrder } : f)
-                            } : null);
+                            setTreeData(prev => prev ? { ...prev, families: prev.families.map(f => f.handle === familyHandle ? { ...f, children: newOrder } : f) } : null);
                             supaUpdateFamilyChildren(familyHandle, newOrder);
                         }}
                         onMoveChild={(childHandle, fromFamily, toFamily) => {
@@ -1011,57 +1127,361 @@ export default function TreeViewPage() {
                         onRemoveChild={(childHandle, familyHandle) => {
                             setTreeData(prev => {
                                 if (!prev) return null;
-                                const families = prev.families.map(f =>
-                                    f.handle === familyHandle ? { ...f, children: f.children.filter(c => c !== childHandle) } : f
-                                );
+                                const families = prev.families.map(f => f.handle === familyHandle ? { ...f, children: f.children.filter(c => c !== childHandle) } : f);
                                 supaRemoveChild(childHandle, familyHandle, prev.families);
                                 return { ...prev, families };
                             });
                         }}
                         onToggleLiving={(handle, isLiving) => {
-                            setTreeData(prev => prev ? {
-                                ...prev,
-                                people: prev.people.map(p => p.handle === handle ? { ...p, isLiving } : p)
-                            } : null);
+                            setTreeData(prev => prev ? { ...prev, people: prev.people.map(p => p.handle === handle ? { ...p, isLiving } : p) } : null);
                             supaUpdatePersonLiving(handle, isLiving);
                         }}
                         onUpdatePerson={(handle, fields) => {
-                            setTreeData(prev => {
-                                if (!prev) return null;
-                                return {
-                                    ...prev,
-                                    people: prev.people.map(p => p.handle === handle ? { ...p, ...fields } : p)
-                                };
-                            });
+                            setTreeData(prev => prev ? { ...prev, people: prev.people.map(p => p.handle === handle ? { ...p, ...fields } : p) } : null);
                             supaUpdatePerson(handle, fields);
                         }}
-                        onReset={async () => {
-                            const data = await fetchTreeData();
-                            setTreeData(data);
-                        }}
+                        onReset={async () => { const data = await fetchTreeData(); setTreeData(data); }}
                         onClose={() => { setEditorMode(false); setSelectedCard(null); }}
                     />
                 )}
             </div>
 
-            {/* Legend */}
-            <div className="flex gap-3 text-[10px] text-muted-foreground pt-1.5 px-1 flex-wrap">
-                <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-blue-100 border border-blue-400" /> Nam (chính tộc)</span>
-                <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-pink-100 border border-pink-400" /> Nữ (chính tộc)</span>
-                <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-slate-100 border border-dashed border-slate-300" /> Ngoại tộc</span>
-                <span className="flex items-center gap-1"><span className="text-red-500">❤</span> Vợ chồng</span>
-                <span className="flex items-center gap-1 opacity-60"><span className="w-2.5 h-2.5 rounded-sm bg-slate-200 border border-slate-400" /> Đã mất</span>
-                <span className="ml-auto opacity-50">Cuộn để zoom • Kéo để di chuyển • Nhấn để xem</span>
+            {/* Legend — desktop only */}
+            <div className="hidden md:flex gap-2 text-[10px] text-muted-foreground pt-1.5 px-1 overflow-x-auto scrollbar-none flex-nowrap">
+                <span className="flex items-center gap-1 shrink-0"><span className="w-2.5 h-2.5 rounded-sm bg-blue-100 border border-blue-400" /> Nam (chính tộc)</span>
+                <span className="flex items-center gap-1 shrink-0"><span className="w-2.5 h-2.5 rounded-sm bg-pink-100 border border-pink-400" /> Nữ (chính tộc)</span>
+                <span className="flex items-center gap-1 shrink-0"><span className="w-2.5 h-2.5 rounded-sm bg-slate-100 border border-dashed border-slate-300" /> Ngoại tộc</span>
+                <span className="flex items-center gap-1 shrink-0"><span className="text-red-500">❤</span> Vợ chồng</span>
+                <span className="flex items-center gap-1 opacity-60 shrink-0"><span className="w-2.5 h-2.5 rounded-sm bg-slate-200 border border-slate-400" /> Đã mất</span>
+                <span className="ml-auto opacity-50 shrink-0">Cuộn để zoom • Kéo để di chuyển • Nhấn để xem</span>
             </div>
-            {/* Contribute dialog */}
+
             {contributePerson && (
-                <ContributeDialog
-                    personHandle={contributePerson.handle}
-                    personName={contributePerson.name}
-                    onClose={() => setContributePerson(null)}
+                <ContributeDialog personHandle={contributePerson.handle} personName={contributePerson.name}
+                    onClose={() => setContributePerson(null)} />
+            )}
+
+            {/* Relationship Finder Dialog */}
+            {showRelFinder && treeData && (
+                <RelationshipFinder
+                    people={treeData.people}
+                    families={treeData.families}
+                    person1={relPerson1}
+                    person2={relPerson2}
+                    search1={relSearch1}
+                    search2={relSearch2}
+                    result={relResult}
+                    onSearch1={setRelSearch1}
+                    onSearch2={setRelSearch2}
+                    onSelect1={(h) => { setRelPerson1(h); setRelSearch1(treeData.people.find(p => p.handle === h)?.displayName ?? ''); setRelResult(null); }}
+                    onSelect2={(h) => { setRelPerson2(h); setRelSearch2(treeData.people.find(p => p.handle === h)?.displayName ?? ''); setRelResult(null); }}
+                    onFind={() => {
+                        if (!relPerson1 || !relPerson2) return;
+                        const result = findRelationship(relPerson1, relPerson2, treeData.people, treeData.families);
+                        setRelResult(result);
+                    }}
+                    onHighlight={() => {
+                        if (!relPerson1 || !relPerson2) return;
+                        const path = findRelationshipPath(relPerson1, relPerson2, treeData.people, treeData.families);
+                        if (path) setHighlightHandles(new Set(path));
+                    }}
+                    onClose={() => { setShowRelFinder(false); setRelPerson1(null); setRelPerson2(null); setRelSearch1(''); setRelSearch2(''); setRelResult(null); }}
                 />
             )}
         </div>
+    );
+}
+
+
+// ═══════════════════════════════════════════════════
+// RELATIONSHIP FINDER
+// ═══════════════════════════════════════════════════
+
+type PathStep = { handle: string; relation: 'parent' | 'child' | 'spouse' };
+
+/** BFS to find shortest path between two people in the family graph */
+function findRelationshipPath(
+    fromHandle: string,
+    toHandle: string,
+    people: TreeNode[],
+    families: TreeFamily[],
+): string[] | null {
+    if (fromHandle === toHandle) return [fromHandle];
+    const personMap = new Map(people.map(p => [p.handle, p]));
+
+    // Build adjacency: each person connects to parents, children, spouses
+    function getNeighbors(handle: string): { handle: string; rel: 'parent' | 'child' | 'spouse' }[] {
+        const p = personMap.get(handle);
+        if (!p) return [];
+        const result: { handle: string; rel: 'parent' | 'child' | 'spouse' }[] = [];
+        // Parents (via parentFamilies)
+        for (const pfId of p.parentFamilies) {
+            const pf = families.find(f => f.handle === pfId);
+            if (!pf) continue;
+            if (pf.fatherHandle) result.push({ handle: pf.fatherHandle, rel: 'parent' });
+            if (pf.motherHandle) result.push({ handle: pf.motherHandle, rel: 'parent' });
+        }
+        // Spouse + children (via families)
+        for (const famId of p.families) {
+            const fam = families.find(f => f.handle === famId);
+            if (!fam) continue;
+            const spouseH = fam.fatherHandle === handle ? fam.motherHandle : fam.fatherHandle;
+            if (spouseH) result.push({ handle: spouseH, rel: 'spouse' });
+            for (const ch of fam.children) result.push({ handle: ch, rel: 'child' });
+        }
+        return result;
+    }
+
+    // BFS
+    const visited = new Set<string>([fromHandle]);
+    const queue: { handle: string; path: string[] }[] = [{ handle: fromHandle, path: [fromHandle] }];
+    while (queue.length > 0) {
+        const { handle, path } = queue.shift()!;
+        for (const { handle: next } of getNeighbors(handle)) {
+            if (visited.has(next)) continue;
+            visited.add(next);
+            const newPath = [...path, next];
+            if (next === toHandle) return newPath;
+            queue.push({ handle: next, path: newPath });
+        }
+    }
+    return null;
+}
+
+/** Interpret the path into a human-readable relationship string */
+function findRelationship(
+    fromHandle: string,
+    toHandle: string,
+    people: TreeNode[],
+    families: TreeFamily[],
+): string {
+    if (fromHandle === toHandle) return 'Đây là cùng một người';
+    const path = findRelationshipPath(fromHandle, toHandle, people, families);
+    if (!path) return 'Không tìm thấy mối quan hệ trong gia phả';
+
+    const personMap = new Map(people.map(p => [p.handle, p]));
+    const fromPerson = personMap.get(fromHandle);
+    const toPerson = personMap.get(toHandle);
+    if (!fromPerson || !toPerson) return 'Không tìm thấy thông tin';
+
+    // Build step directions
+    type Dir = 'up' | 'down' | 'spouse';
+    const dirs: Dir[] = [];
+    for (let i = 0; i < path.length - 1; i++) {
+        const cur = path[i];
+        const next = path[i + 1];
+        const curP = personMap.get(cur);
+        if (!curP) continue;
+        // Check if next is a parent of cur
+        const isParent = curP.parentFamilies.some(pfId => {
+            const pf = families.find(f => f.handle === pfId);
+            return pf && (pf.fatherHandle === next || pf.motherHandle === next);
+        });
+        if (isParent) { dirs.push('up'); continue; }
+        // Check if next is a child of cur
+        const isChild = curP.families.some(famId => {
+            const fam = families.find(f => f.handle === famId);
+            return fam && fam.children.includes(next);
+        });
+        if (isChild) { dirs.push('down'); continue; }
+        dirs.push('spouse');
+    }
+
+    const isMale = (h: string) => personMap.get(h)?.gender === 1;
+    const isA = fromHandle; // A = người hỏi
+    const isB = toHandle;   // B = người kia
+
+    const ups = dirs.filter(d => d === 'up').length;
+    const downs = dirs.filter(d => d === 'down').length;
+    const spouses = dirs.filter(d => d === 'spouse').length;
+    const pattern = dirs.join('-');
+
+    const nameA = fromPerson.displayName;
+    const nameB = toPerson.displayName;
+    const gB = isMale(isB) ? 'ông' : 'bà';
+    const gA = isMale(isA) ? 'ông' : 'bà';
+
+    // Direct relationships
+    if (pattern === 'down') return `${nameA} là cha/mẹ của ${nameB}`;
+    if (pattern === 'up') return `${nameA} là con của ${nameB}`;
+    if (pattern === 'spouse') return `${nameA} và ${nameB} là vợ chồng`;
+
+    // 2 steps
+    if (pattern === 'down-down') return `${nameA} là ông/bà của ${nameB}`;
+    if (pattern === 'up-up') return `${nameA} là cháu nội/ngoại của ${nameB}`;
+    if (pattern === 'up-down' || pattern === 'down-up') return `${nameA} và ${nameB} là anh/chị/em ruột`;
+    if (pattern === 'spouse-down') return `${nameB} là con riêng của vợ/chồng ${nameA}`;
+    if (pattern === 'down-spouse') return `${nameB} là vợ/chồng của con ${nameA}`;
+    if (pattern === 'up-spouse') return `${nameB} là vợ/chồng của cha/mẹ ${nameA} (kế phụ/mẫu)`;
+
+    // 3 steps
+    if (pattern === 'down-down-down') return `${nameA} là cụ (3 đời) của ${nameB}`;
+    if (pattern === 'up-up-up') return `${nameA} là chắt của ${nameB}`;
+    if (pattern === 'up-up-down') return `${nameA} và ${nameB} là cô/chú/bác và cháu`;
+    if (pattern === 'up-down-down') return `${nameA} là cháu, ${nameB} là cô/chú/bác`;
+    if (pattern === 'down-up-down') return `${nameA} và ${nameB} là anh/chị/em họ`;
+
+    // 4 steps
+    if (pattern === 'up-up-down-down') return `${nameA} và ${nameB} là anh/chị/em họ`;
+    if (pattern === 'up-up-up-down') return `${nameA} là cháu (con của cháu ruột) của ${nameB}`;
+    if (pattern === 'down-down-up-down') return `${nameA} và ${nameB} là con cô con cậu`;
+
+    // Generic fallback with generation difference
+    const genA = fromPerson.generation ?? 0;
+    const genB = toPerson.generation ?? 0;
+    const genDiff = genB - genA;
+    const distance = path.length - 1;
+
+    if (genDiff === 0) return `${nameA} và ${nameB} cùng đời, cách ${distance} bậc quan hệ`;
+    if (genDiff > 0) return `${nameA} (đời ${genA}) là tổ tiên ${genDiff} đời của ${nameB} (đời ${genB})`;
+    return `${nameA} (đời ${genA}) là hậu duệ đời thứ ${Math.abs(genDiff)} của ${nameB} (đời ${genB})`;
+}
+
+// ── Relationship Finder UI ──
+function RelationshipFinder({ people, families, person1, person2, search1, search2, result,
+    onSearch1, onSearch2, onSelect1, onSelect2, onFind, onHighlight, onClose }: {
+    people: TreeNode[];
+    families: TreeFamily[];
+    person1: string | null;
+    person2: string | null;
+    search1: string;
+    search2: string;
+    result: string | null;
+    onSearch1: (s: string) => void;
+    onSearch2: (s: string) => void;
+    onSelect1: (h: string) => void;
+    onSelect2: (h: string) => void;
+    onFind: () => void;
+    onHighlight: () => void;
+    onClose: () => void;
+}) {
+    const filter = (q: string) => q.trim()
+        ? people.filter(p => p.displayName.toLowerCase().includes(q.toLowerCase())).slice(0, 6)
+        : [];
+    const results1 = filter(search1);
+    const results2 = filter(search2);
+    const [showD1, setShowD1] = useState(false);
+    const [showD2, setShowD2] = useState(false);
+
+    return (
+        <>
+            <div className="fixed inset-0 z-50 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+            <div className="fixed inset-x-4 top-1/2 -translate-y-1/2 z-50 bg-background rounded-2xl shadow-2xl border
+                max-w-sm mx-auto animate-in fade-in zoom-in-95 duration-150">
+                {/* Header */}
+                <div className="flex items-center justify-between px-4 py-3 border-b">
+                    <div className="flex items-center gap-2">
+                        <Shuffle className="h-4 w-4 text-primary" />
+                        <span className="font-semibold text-sm">Tìm mối quan hệ</span>
+                    </div>
+                    <button onClick={onClose} className="p-1 rounded-full hover:bg-muted">
+                        <X className="h-4 w-4 text-muted-foreground" />
+                    </button>
+                </div>
+
+                <div className="p-4 space-y-3">
+                    {/* Person 1 */}
+                    <div className="relative">
+                        <label className="text-xs font-medium text-muted-foreground block mb-1">Người thứ nhất</label>
+                        <div className="relative">
+                            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                            <input
+                                className="w-full border rounded-lg pl-8 pr-3 py-2 text-sm bg-background"
+                                placeholder="Tìm tên..."
+                                value={search1}
+                                onChange={e => { onSearch1(e.target.value); setShowD1(true); }}
+                                onFocus={() => setShowD1(true)}
+                            />
+                        </div>
+                        {showD1 && results1.length > 0 && (
+                            <div className="absolute z-10 top-full left-0 right-0 mt-1 bg-background border rounded-lg shadow-lg max-h-44 overflow-y-auto">
+                                {results1.map(p => (
+                                    <button key={p.handle}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-accent flex justify-between"
+                                        onClick={() => { onSelect1(p.handle); setShowD1(false); }}>
+                                        <span>{p.displayName}</span>
+                                        <span className="text-xs text-muted-foreground">Đời {(p as any).generation}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                        {person1 && (
+                            <p className="text-xs text-emerald-600 mt-1 flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                                Đã chọn: {people.find(p => p.handle === person1)?.displayName}
+                            </p>
+                        )}
+                    </div>
+
+                    {/* Swap icon */}
+                    <div className="flex justify-center">
+                        <div className="w-6 h-6 rounded-full border flex items-center justify-center text-muted-foreground text-xs">↕</div>
+                    </div>
+
+                    {/* Person 2 */}
+                    <div className="relative">
+                        <label className="text-xs font-medium text-muted-foreground block mb-1">Người thứ hai</label>
+                        <div className="relative">
+                            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                            <input
+                                className="w-full border rounded-lg pl-8 pr-3 py-2 text-sm bg-background"
+                                placeholder="Tìm tên..."
+                                value={search2}
+                                onChange={e => { onSearch2(e.target.value); setShowD2(true); }}
+                                onFocus={() => setShowD2(true)}
+                            />
+                        </div>
+                        {showD2 && results2.length > 0 && (
+                            <div className="absolute z-10 top-full left-0 right-0 mt-1 bg-background border rounded-lg shadow-lg max-h-44 overflow-y-auto">
+                                {results2.map(p => (
+                                    <button key={p.handle}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-accent flex justify-between"
+                                        onClick={() => { onSelect2(p.handle); setShowD2(false); }}>
+                                        <span>{p.displayName}</span>
+                                        <span className="text-xs text-muted-foreground">Đời {(p as any).generation}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                        {person2 && (
+                            <p className="text-xs text-emerald-600 mt-1 flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                                Đã chọn: {people.find(p => p.handle === person2)?.displayName}
+                            </p>
+                        )}
+                    </div>
+
+                    {/* Result */}
+                    {result && (
+                        <div className={`rounded-xl p-3 text-sm font-medium text-center border
+                            ${result.includes('Không') ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>
+                            {result}
+                        </div>
+                    )}
+
+                    {/* Buttons */}
+                    <div className="flex gap-2">
+                        <button
+                            className="flex-1 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground
+                                disabled:opacity-40 active:opacity-80 transition-opacity"
+                            disabled={!person1 || !person2}
+                            onClick={onFind}
+                        >
+                            Tìm quan hệ
+                        </button>
+                        {result && !result.includes('Không') && (
+                            <button
+                                className="px-3 py-2 rounded-lg text-sm border hover:bg-muted transition-colors"
+                                onClick={() => { onHighlight(); onClose(); }}
+                                title="Highlight đường đi trên cây"
+                            >
+                                Xem trên cây
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+        </>
     );
 }
 
@@ -1079,10 +1499,72 @@ function CardContextMenu({ person, x, y, onViewDetail, onShowDescendants, onShow
     onContribute: () => void;
     onClose: () => void;
 }) {
+    // On mobile, show as a bottom sheet; on desktop, show near the tap position
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+
+    if (isMobile) {
+        return (
+            <>
+                {/* Backdrop */}
+                <div
+                    className="fixed inset-0 z-40 bg-black/20"
+                    onClick={onClose}
+                />
+                {/* Bottom sheet */}
+                <div
+                    className="fixed bottom-0 left-0 right-0 z-50 animate-in slide-in-from-bottom-4 duration-200"
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    <div className="bg-white/98 backdrop-blur-lg border-t border-slate-200 rounded-t-2xl shadow-2xl pb-safe">
+                        {/* Handle */}
+                        <div className="flex justify-center pt-2 pb-1">
+                            <div className="w-10 h-1 rounded-full bg-slate-300" />
+                        </div>
+                        {/* Header */}
+                        <div className="px-4 py-2.5 border-b border-slate-100 flex items-center justify-between">
+                            <div className="flex items-center gap-2.5">
+                                <div className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold
+                                    ${person.isPatrilineal
+                                        ? (person.gender === 1 ? 'bg-blue-100 text-blue-700' : 'bg-pink-100 text-pink-700')
+                                        : 'bg-slate-100 text-slate-500'}`}>
+                                    {person.displayName.split(' ').map(w => w[0]).join('').slice(0, 2)}
+                                </div>
+                                <span className="text-base font-semibold text-slate-800 truncate max-w-[220px]">{person.displayName}</span>
+                            </div>
+                            <button onClick={onClose} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-400">
+                                <X className="w-4 h-4" />
+                            </button>
+                        </div>
+                        {/* Actions grid */}
+                        <div className="py-2 grid grid-cols-1 divide-y divide-slate-50">
+                            <MenuAction icon={<User className="w-4 h-4" />} label="Xem chi tiết" desc="Mở trang cá nhân" onClick={onViewDetail} />
+                            <MenuAction icon={<ArrowDownToLine className="w-4 h-4" />} label="Hậu duệ từ đây" desc="Hiển thị cây con cháu" onClick={onShowDescendants} />
+                            <MenuAction icon={<ArrowUpFromLine className="w-4 h-4" />} label="Tổ tiên" desc="Hiển thị dòng tổ tiên" onClick={onShowAncestors} />
+                            <MenuAction icon={<Crosshair className="w-4 h-4" />} label="Căn giữa" desc="Di chuyển tới vị trí" onClick={onSetFocus} />
+                            <MenuAction icon={<Link className="w-4 h-4" />} label="Sao chép link hậu duệ" desc="Chia sẻ link cây con cháu" onClick={onCopyLink} />
+                            <MenuAction icon={<Eye className="w-4 h-4" />} label="Toàn cảnh" desc="Hiển thị toàn bộ cây" onClick={onShowFull} />
+                            <MenuAction icon={<MessageSquarePlus className="w-4 h-4" />} label="Đóng góp thông tin" desc="Bổ sung thông tin về người này" onClick={onContribute} />
+                        </div>
+                        {/* Safe area spacer */}
+                        <div className="h-4" />
+                    </div>
+                </div>
+            </>
+        );
+    }
+
+    // Desktop: position near click, clamp to viewport
+    const menuW = 220;
+    const menuH = 380;
+    const vw = typeof window !== 'undefined' ? window.innerWidth : 1200;
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+    const left = Math.min(x + 8, vw - menuW - 8);
+    const top = Math.min(y + 8, vh - menuH - 8);
+
     return (
         <div
-            className="absolute z-50 animate-in fade-in zoom-in-95 duration-150"
-            style={{ left: x + 8, top: y + 8 }}
+            className="fixed z-50 animate-in fade-in zoom-in-95 duration-150"
+            style={{ left, top }}
             onClick={(e) => e.stopPropagation()}
         >
             <div className="bg-white/95 backdrop-blur-lg border border-slate-200 rounded-xl shadow-xl
@@ -1179,7 +1661,7 @@ function PersonCard({ item, isHighlighted, isFocused, isHovered, isSelected, zoo
                 style={{ left: x + CARD_W / 2 - 6, top: y + CARD_H / 2 - 6, width: 12, height: 12 }}
                 onMouseEnter={() => onHover(node.handle)}
                 onMouseLeave={() => onHover(null)}
-                onClick={(e) => { e.stopPropagation(); onClick(node.handle, x + CARD_W, y + CARD_H / 2); }}
+                onClick={(e) => { e.stopPropagation(); onClick(node.handle, e.clientX, e.clientY); }}
             >
                 <div className="w-3 h-3 rounded-full shadow-sm" style={{ backgroundColor: dotColor }} />
                 {/* Tooltip on hover */}
@@ -1232,7 +1714,7 @@ function PersonCard({ item, isHighlighted, isFocused, isHovered, isSelected, zoo
                 style={{ left: x, top: y, width: CARD_W, height: CARD_H }}
                 onMouseEnter={() => onHover(node.handle)}
                 onMouseLeave={() => onHover(null)}
-                onClick={(e) => { e.stopPropagation(); onClick(node.handle, x + CARD_W, y + CARD_H / 2); }}
+                onClick={(e) => { e.stopPropagation(); onClick(node.handle, e.clientX, e.clientY); }}
             >
                 <div className="px-2 py-1.5 h-full flex items-center gap-2">
                     <div className={`w-7 h-7 rounded-full flex items-center justify-center
@@ -1262,13 +1744,13 @@ function PersonCard({ item, isHighlighted, isFocused, isHovered, isSelected, zoo
     // F1: FULL zoom → original detailed card
     return (
         <div
-            className={`absolute rounded-xl border-[1.5px] bg-gradient-to-br shadow-sm transition-all duration-200
-                cursor-pointer hover:shadow-md hover:-translate-y-0.5 ${bgClass} ${glowClass}
+            className={`absolute rounded-xl border-[1.5px] bg-gradient-to-br shadow-sm transition-shadow duration-200
+                cursor-pointer hover:shadow-md ${bgClass} ${glowClass}
                 ${isDead ? 'opacity-70' : ''} ${!isPatri ? 'opacity-80' : ''}`}
             style={{ left: x, top: y, width: CARD_W, height: CARD_H }}
             onMouseEnter={() => onHover(node.handle)}
             onMouseLeave={() => onHover(null)}
-            onClick={(e) => { e.stopPropagation(); onClick(node.handle, x + CARD_W, y + CARD_H / 2); }}
+            onClick={(e) => { e.stopPropagation(); onClick(node.handle, e.clientX, e.clientY); }}
             onContextMenu={(e) => { e.preventDefault(); onSetFocus(node.handle); }}
         >
             <div className="px-2.5 py-2 h-full flex items-center gap-2.5">
@@ -1561,9 +2043,12 @@ function EditorPanel({ selectedCard, treeData, onReorderChildren, onMoveChild, o
         ? treeData.families.find(f => f.children.includes(person.handle))
         : null;
 
-    // Get parent person name
-    const parentPerson = childOfFamily
-        ? treeData.people.find(p => p.handle === childOfFamily.fatherHandle || p.handle === childOfFamily.motherHandle)
+    // Get father and mother separately
+    const parentFather = childOfFamily?.fatherHandle
+        ? treeData.people.find(p => p.handle === childOfFamily.fatherHandle)
+        : null;
+    const parentMother = childOfFamily?.motherHandle
+        ? treeData.people.find(p => p.handle === childOfFamily.motherHandle)
         : null;
 
     // Children of the selected person's family
@@ -1605,7 +2090,14 @@ function EditorPanel({ selectedCard, treeData, onReorderChildren, onMoveChild, o
     };
 
     return (
-        <div className="w-72 bg-background border-l flex flex-col overflow-hidden flex-shrink-0">
+        <>
+        {/* Mobile backdrop — only when a card is selected */}
+        {person && <div className="md:hidden fixed inset-0 z-40 bg-black/20" onClick={onClose} />}
+        <div className={`fixed md:relative bottom-0 left-0 right-0 md:bottom-auto md:left-auto md:right-auto z-50 md:z-auto w-full md:w-64 max-h-[60vh] md:max-h-none bg-background border-t md:border-t-0 md:border-l flex-col overflow-hidden md:flex-shrink-0 rounded-t-2xl md:rounded-none shadow-2xl md:shadow-none ${!person ? 'hidden md:flex' : 'flex'}`}>
+            {/* Mobile drag handle */}
+            <div className="md:hidden flex justify-center pt-2.5 pb-1 shrink-0">
+                <div className="w-10 h-1 rounded-full bg-muted-foreground/30" />
+            </div>
             {/* Header */}
             <div className="flex items-center justify-between px-3 py-2 border-b bg-blue-50">
                 <div className="flex items-center gap-2">
@@ -1633,9 +2125,14 @@ function EditorPanel({ selectedCard, treeData, onReorderChildren, onMoveChild, o
                     {/* Editable person info */}
                     <div className="p-3 border-b space-y-2">
                         <p className="text-xs text-muted-foreground">Đời {(person as any).generation ?? '?'} · {person.handle}</p>
-                        {parentPerson && (
+                        {parentFather && (
                             <p className="text-xs text-muted-foreground">
-                                Cha: <span className="font-medium text-foreground">{parentPerson.displayName}</span>
+                                Cha: <span className="font-medium text-foreground">{parentFather.displayName}</span>
+                            </p>
+                        )}
+                        {parentMother && (
+                            <p className="text-xs text-muted-foreground">
+                                Mẹ: <span className="font-medium text-foreground">{parentMother.displayName}</span>
                             </p>
                         )}
 
@@ -1696,7 +2193,7 @@ function EditorPanel({ selectedCard, treeData, onReorderChildren, onMoveChild, o
                                     <div key={child.handle} className="flex items-center gap-1 group">
                                         <GripVertical className="h-3 w-3 text-muted-foreground/40" />
                                         <span className="flex-1 text-xs truncate">{child.displayName}</span>
-                                        <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <div className="flex gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                                             {idx > 0 && (
                                                 <button
                                                     className="p-0.5 rounded hover:bg-muted"
@@ -1749,7 +2246,7 @@ function EditorPanel({ selectedCard, treeData, onReorderChildren, onMoveChild, o
                             </p>
                             {/* Current parent display */}
                             <p className="text-xs text-muted-foreground mb-1">
-                                Hiện tại: <span className="font-medium text-foreground">{parentPerson?.displayName ?? childOfFamily.handle}</span>
+                                Hiện tại: <span className="font-medium text-foreground">{parentFather?.displayName ?? parentMother?.displayName ?? childOfFamily.handle}</span>
                             </p>
                             {/* Searchable input */}
                             <div className="relative">
@@ -1797,5 +2294,6 @@ function EditorPanel({ selectedCard, treeData, onReorderChildren, onMoveChild, o
                 </div>
             )}
         </div>
+        </>
     );
 }
